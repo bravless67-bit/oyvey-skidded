@@ -1,0 +1,576 @@
+package badis.client.module.combat;
+
+import badis.client.BadisClient;
+import badis.client.Category;
+import badis.client.Module;
+import badis.client.ModuleManager;
+import badis.client.setting.BooleanSetting;
+import badis.client.setting.ModeSetting;
+import badis.client.setting.NumberSetting;
+import badis.client.setting.TextSetting;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
+import net.minecraft.entity.mob.HostileEntity;
+import net.minecraft.entity.passive.PassiveEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.SwordItem;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+import java.util.List;
+import java.util.Random;
+
+public class AimAssist extends Module {
+    private final ModeSetting mode = new ModeSetting("Mode", "Assist method",
+        "Smooth", List.of("Smooth", "Sticky", "Hybrid", "Flick"));
+    private final BooleanSetting horizontal = new BooleanSetting("Horizontal", "Pull crosshair horizontally (right-click to bind a key)", true);
+    private final NumberSetting hSpeed = new NumberSetting("H Speed", "Horizontal pull strength (0 = disabled, higher = faster)", 3.0, 0.0, 20.0, 0.1);
+    private final NumberSetting hMultiplier = new NumberSetting("H Multiplier", "Extra horizontal gain", 1.0, 0.0, 5.0, 0.05);
+    private final NumberSetting hFov = new NumberSetting("H FOV", "Horizontal angle (deg) the assist will engage in", 80.0, 0.0, 180.0, 1.0);
+    private final NumberSetting hDeadZone = new NumberSetting("H Dead Zone", "Stop pulling horizontally once within this many degrees", 0.3, 0.0, 8.0, 0.05);
+    private final NumberSetting hMaxPerTick = new NumberSetting("H Max/Tick", "Hard cap on horizontal degrees per tick", 8.0, 0.0, 30.0, 0.25);
+    private final BooleanSetting vertical = new BooleanSetting("Vertical", "Pull crosshair vertically (right-click to bind a key)", true);
+    private final NumberSetting vSpeed = new NumberSetting("V Speed", "Vertical pull strength (0 = disabled, higher = faster)", 2.0, 0.0, 20.0, 0.1);
+    private final NumberSetting vMultiplier = new NumberSetting("V Multiplier", "Extra vertical gain", 1.0, 0.0, 5.0, 0.05);
+    private final NumberSetting vFov = new NumberSetting("V FOV", "Vertical angle (deg) the assist will engage in", 60.0, 0.0, 180.0, 1.0);
+    private final NumberSetting vDeadZone = new NumberSetting("V Dead Zone", "Stop pulling vertically once within this many degrees", 0.3, 0.0, 8.0, 0.05);
+    private final NumberSetting vMaxPerTick = new NumberSetting("V Max/Tick", "Hard cap on vertical degrees per tick", 5.0, 0.0, 30.0, 0.25);
+    private final NumberSetting vOffset = new NumberSetting("V Offset", "Bias aim Y on the entity (- = aim down, + = aim up)", 0.0, -1.0, 1.0, 0.05);
+    private final NumberSetting lockRange = new NumberSetting("Lock Range", "Horizontal distance to target (blocks) within which the assist engages", 4.0, 0.5, 12.0, 0.1);
+    private final NumberSetting smoothness = new NumberSetting("Smoothness", "Both axes - 0 = snappy, 1 = silky", 0.55, 0.0, 1.0, 0.05);
+    private final NumberSetting hSmoothnessOverride = new NumberSetting("H Smoothness", "Horizontal-only smoothness (-1 = use main slider)", -1.0, -1.0, 1.0, 0.05);
+    private final NumberSetting vSmoothnessOverride = new NumberSetting("V Smoothness", "Vertical-only smoothness (-1 = use main slider)", -1.0, -1.0, 1.0, 0.05);
+    private final NumberSetting stickyStrength = new NumberSetting("Sticky Strength", "How hard Sticky/Hybrid pulls when on target", 0.6, 0.0, 1.0, 0.05);
+    private final NumberSetting jitter = new NumberSetting("Jitter", "Random aim offset for human-like movement", 0.0, 0.0, 2.0, 0.05);
+    private final NumberSetting chance = new NumberSetting("Chance", "Per-target probability the assist engages (100 = always)", 100.0, 1.0, 100.0, 1.0);
+    private final NumberSetting prediction = new NumberSetting("Prediction", "Lead moving targets (0 = none, 1 = full velocity lead)", 1.0, 0.0, 2.0, 0.05);
+    private final NumberSetting hybridBlend = new NumberSetting("Hybrid Blend", "Angle (deg) over which Hybrid fades smooth -> sticky", 6.0, 1.0, 20.0, 0.5);
+    private final TextSetting targetPlayer = new TextSetting("Target Player", "Only assist toward this username (blank = any)", "");
+    private final BooleanSetting strictUsername = new BooleanSetting("Strict Username", "If username is set and player isn't visible, don't aim at anyone", false);
+    private final NumberSetting range = new NumberSetting("Range", "Max target distance", 4.5, 0.0, 12.0, 0.1);
+    private final BooleanSetting targetPlayers = new BooleanSetting("Players", "Assist toward players", true);
+    private final BooleanSetting targetHostiles = new BooleanSetting("Hostiles", "Assist toward hostile mobs", false);
+    private final BooleanSetting targetAnimals = new BooleanSetting("Animals", "Assist toward animals", false);
+    private final BooleanSetting visibilityCheck = new BooleanSetting("Visibility", "Only assist toward visible targets (no wall aim)", true);
+    private final BooleanSetting targetLock = new BooleanSetting("Target Lock", "Stay locked on same target until it leaves range/FOV", true);
+    private final BooleanSetting lowHpPriority = new BooleanSetting("Low HP Priority", "Prefer the lowest-HP target when scoring", false);
+    private final BooleanSetting lockLastHit = new BooleanSetting("Lock Last Hit", "Hard-lock onto the player you most recently swung on", false);
+    private final NumberSetting lastHitMemory = new NumberSetting("Last Hit Memory", "How long to keep preferring the last-hit target (ms)", 4000.0, 500.0, 15000.0, 100.0);
+    private final ModeSetting aimPoint = new ModeSetting("Aim Point", "Where to aim on the entity",
+        "Body", List.of("Head", "Body", "Feet", "Nearest"));
+    private final BooleanSetting onlyAttacking = new BooleanSetting("Only Attacking", "Only assist when holding attack button", false);
+    private final BooleanSetting weaponOnly = new BooleanSetting("Weapon Only", "Only assist when holding a weapon", true);
+
+    private Entity targetLocked = null;
+    private final Random random = new Random();
+    private Entity chanceSkipTarget = null;
+    private boolean chancePassed = false;
+    private Entity chanceTarget = null;
+    private Entity currentTarget = null;
+    private boolean isLastHitLocked = false;
+    private double smoothProgress = 0.0;
+    private boolean inDeadZoneH = false;
+    private boolean inDeadZoneV = false;
+    private Vec3d velocitySmooth = Vec3d.ZERO;
+
+    public AimAssist() {
+        super("AimAssist", "Helps your aim follow nearby targets", Category.Combat, -1);
+        addSetting(mode);
+        addSetting(horizontal);
+        addSetting(hSpeed);
+        addSetting(hMultiplier);
+        addSetting(hFov);
+        addSetting(hDeadZone);
+        addSetting(hMaxPerTick);
+        addSetting(vertical);
+        addSetting(vSpeed);
+        addSetting(vMultiplier);
+        addSetting(vFov);
+        addSetting(vDeadZone);
+        addSetting(vMaxPerTick);
+        addSetting(vOffset);
+        addSetting(lockRange);
+        addSetting(smoothness);
+        addSetting(hSmoothnessOverride);
+        addSetting(vSmoothnessOverride);
+        addSetting(stickyStrength);
+        addSetting(jitter);
+        addSetting(chance);
+        addSetting(prediction);
+        addSetting(hybridBlend);
+        addSetting(targetPlayer);
+        addSetting(strictUsername);
+        addSetting(range);
+        addSetting(targetPlayers);
+        addSetting(targetHostiles);
+        addSetting(targetAnimals);
+        addSetting(visibilityCheck);
+        addSetting(targetLock);
+        addSetting(lowHpPriority);
+        addSetting(lockLastHit);
+        addSetting(lastHitMemory);
+        addSetting(aimPoint);
+        addSetting(onlyAttacking);
+        addSetting(weaponOnly);
+        stickyStrength.setVisibility(() -> mode.is("Sticky") || mode.is("Hybrid"));
+        hybridBlend.setVisibility(() -> mode.is("Hybrid"));
+        smoothness.setVisibility(() -> mode.is("Smooth") || mode.is("Hybrid"));
+        hSmoothnessOverride.setVisibility(() -> mode.is("Smooth") || mode.is("Hybrid"));
+        vSmoothnessOverride.setVisibility(() -> mode.is("Smooth") || mode.is("Hybrid"));
+        strictUsername.setVisibility(() -> !targetPlayer.getValue().isEmpty());
+    }
+
+    @Override
+    public void onEnable() {
+        targetLocked = null;
+        currentTarget = null;
+        isLastHitLocked = false;
+        smoothProgress = 0.0;
+        inDeadZoneH = false;
+        inDeadZoneV = false;
+        velocitySmooth = Vec3d.ZERO;
+        chanceSkipTarget = null;
+        chancePassed = false;
+        chanceTarget = null;
+    }
+
+    @Override
+    public void onDisable() {
+        currentTarget = null;
+        isLastHitLocked = false;
+    }
+
+    @Override
+    public void onTick() {
+        if (mc.player == null || mc.world == null) {
+            currentTarget = null;
+            isLastHitLocked = false;
+            return;
+        }
+        if (mc.currentScreen != null) {
+            currentTarget = null;
+            isLastHitLocked = false;
+            return;
+        }
+        if (weaponOnly.getValue() && !(mc.player.getMainHandStack().getItem() instanceof SwordItem)) {
+            currentTarget = null;
+            isLastHitLocked = false;
+            return;
+        }
+        if (onlyAttacking.getValue() && !mc.options.attackKey.isPressed()) {
+            currentTarget = null;
+            isLastHitLocked = false;
+            return;
+        }
+        Entity prevTarget = currentTarget;
+        Entity candidate = findTarget();
+        if (candidate == null) {
+            currentTarget = null;
+            isLastHitLocked = false;
+            targetLocked = null;
+            smoothProgress = 0.0;
+            inDeadZoneH = false;
+            inDeadZoneV = false;
+            velocitySmooth = Vec3d.ZERO;
+            chanceSkipTarget = null;
+            chancePassed = false;
+            chanceTarget = null;
+            return;
+        }
+        boolean lockActive = false;
+        if (lockLastHit.getValue()) {
+            ModuleManager mm = BadisClient.getInstance().getModuleManager();
+            long elapsed = (System.nanoTime() - mm.getTargetTime()) / 1000000L;
+            lockActive = candidate == mm.getTarget() && elapsed <= (long) lastHitMemory.getValue();
+        }
+        int chanceVal = chance.getValue().intValue();
+        if (chanceVal < 100 && !lockActive) {
+            if (candidate != chanceTarget) {
+                chanceTarget = candidate;
+                chancePassed = random.nextInt(100) < chanceVal;
+                if (!chancePassed) chanceSkipTarget = candidate;
+                else chanceSkipTarget = null;
+            }
+            if (candidate == chanceSkipTarget) {
+                currentTarget = null;
+                isLastHitLocked = false;
+                smoothProgress = 0.0;
+                inDeadZoneH = false;
+                inDeadZoneV = false;
+                velocitySmooth = Vec3d.ZERO;
+                return;
+            }
+        } else {
+            chanceTarget = candidate;
+            chancePassed = true;
+            chanceSkipTarget = null;
+        }
+        currentTarget = candidate;
+        isLastHitLocked = lockActive;
+        if (candidate != prevTarget) {
+            smoothProgress = 0.0;
+            velocitySmooth = Vec3d.ZERO;
+            inDeadZoneH = false;
+            inDeadZoneV = false;
+        } else {
+            double vx = candidate.getX() - candidate.lastRenderX;
+            double vy = candidate.getY() - candidate.lastRenderY;
+            double vz = candidate.getZ() - candidate.lastRenderZ;
+            velocitySmooth = new Vec3d(
+                velocitySmooth.x * 0.6 + vx * 0.4,
+                velocitySmooth.y * 0.6 + vy * 0.4,
+                velocitySmooth.z * 0.6 + vz * 0.4
+            );
+        }
+    }
+
+    @Override
+    public void onUpdate(double delta) {
+        if (!isEnabled()) return;
+        Entity target = currentTarget;
+        if (target == null) return;
+        if (mc.player == null || mc.world == null) return;
+        if (mc.currentScreen != null) return;
+        if (weaponOnly.getValue() && !(mc.player.getMainHandStack().getItem() instanceof SwordItem)) return;
+        if (onlyAttacking.getValue() && !mc.options.attackKey.isPressed()) return;
+
+        smoothProgress = Math.min(1.0, smoothProgress + delta / 0.12);
+        Vec3d aimPos = getPredictedPosition(target);
+        double[] rotation = getRotationTo(aimPos);
+        double targetYaw = rotation[0];
+        double targetPitch = rotation[1];
+        float currentYaw = mc.player.getYaw();
+        float currentPitch = mc.player.getPitch();
+        double yawDiff = MathHelper.wrapDegrees(targetYaw - currentYaw);
+        double pitchDiff = targetPitch - currentPitch;
+        double absYawDiff = Math.abs(yawDiff);
+        double absPitchDiff = Math.abs(pitchDiff);
+
+        boolean hActive = horizontal.getValue() && hSpeed.getValue() > 0.0;
+        boolean vActive = vertical.getValue() && vSpeed.getValue() > 0.0;
+        if (!hActive && !vActive) return;
+
+        boolean hInFov = hActive && absYawDiff <= hFov.getValue() / 2.0;
+        boolean vInFov = vActive && absPitchDiff <= vFov.getValue() / 2.0;
+        if (isLastHitLocked) {
+            hInFov = hActive;
+            vInFov = vActive;
+        } else if (!hInFov && !vInFov) {
+            targetLocked = null;
+            currentTarget = null;
+            return;
+        }
+
+        double rangeFactor = 1.0;
+        double dist = Math.sqrt(Math.pow(target.getX() - mc.player.getX(), 2) + Math.pow(target.getZ() - mc.player.getZ(), 2));
+        double lockDist = lockRange.getValue();
+        if (dist > lockDist) {
+            smoothProgress = 0.0;
+            return;
+        }
+        double fadeMargin = Math.max(0.1, lockDist * 0.1);
+        if (dist > lockDist - fadeMargin) {
+            double t = (lockDist - dist) / fadeMargin;
+            rangeFactor = t * t * (3.0 - 2.0 * t);
+        }
+
+        double hPull = hSpeed.getValue() * hMultiplier.getValue();
+        double vPull = vSpeed.getValue() * vMultiplier.getValue();
+        double hSmooth = getSmoothness(true);
+        double vSmooth = getSmoothness(false);
+        double yawMove = 0.0;
+        double pitchMove = 0.0;
+
+        switch (mode.getValue()) {
+            case "Smooth": {
+                double[] result = smoothAim(hInFov ? yawDiff : 0.0, vInFov ? pitchDiff : 0.0,
+                    hPull, vPull, hSmooth, vSmooth, hDeadZone.getValue(), vDeadZone.getValue(), delta);
+                if (hInFov) yawMove = result[0];
+                if (vInFov) pitchMove = result[1];
+                break;
+            }
+            case "Sticky": {
+                if (hInFov) yawMove = stickyPull(yawDiff, hPull, hDeadZone.getValue(), absYawDiff, delta);
+                if (vInFov) pitchMove = stickyPull(pitchDiff, vPull, vDeadZone.getValue(), absPitchDiff, delta);
+                break;
+            }
+            case "Hybrid": {
+                double[] result = smoothAim(hInFov ? yawDiff : 0.0, vInFov ? pitchDiff : 0.0,
+                    hPull, vPull, hSmooth, vSmooth, hDeadZone.getValue(), vDeadZone.getValue(), delta);
+                double blendAngle = hybridBlend.getValue();
+                if (hInFov) {
+                    double t = clamp(1.0 - absYawDiff / Math.max(0.5, blendAngle), 0.0, 1.0);
+                    t = t * t * (3.0 - 2.0 * t);
+                    double s = stickyPull(yawDiff, hPull, hDeadZone.getValue(), absYawDiff, delta);
+                    yawMove = MathHelper.lerp(t, result[0], s);
+                }
+                if (vInFov) {
+                    double t = clamp(1.0 - absPitchDiff / Math.max(0.5, blendAngle), 0.0, 1.0);
+                    t = t * t * (3.0 - 2.0 * t);
+                    double s = stickyPull(pitchDiff, vPull, vDeadZone.getValue(), absPitchDiff, delta);
+                    pitchMove = MathHelper.lerp(t, result[1], s);
+                }
+                break;
+            }
+            case "Flick": {
+                if (hInFov) yawMove = flickPull(yawDiff, hPull, hDeadZone.getValue(), delta);
+                if (vInFov) pitchMove = flickPull(pitchDiff, vPull, vDeadZone.getValue(), delta);
+                break;
+            }
+        }
+
+        if (rangeFactor < 1.0) {
+            yawMove *= rangeFactor;
+            pitchMove *= rangeFactor;
+        }
+
+        if (jitter.getValue() > 0.0) {
+            double j = jitter.getValue() * Math.sqrt(delta / 0.05);
+            yawMove += random.nextGaussian() * j * 0.2 * Math.min(1.0, absYawDiff / 8.0);
+            pitchMove += random.nextGaussian() * j * 0.15 * Math.min(1.0, absPitchDiff / 8.0);
+        }
+
+        applyRotation(yawMove, pitchMove);
+    }
+
+    private double getSmoothness(boolean horizontal) {
+        double override = horizontal ? hSmoothnessOverride.getValue() : vSmoothnessOverride.getValue();
+        if (override < 0.0) return smoothness.getValue();
+        return override;
+    }
+
+    private double[] smoothAim(double yawDiff, double pitchDiff, double hPull, double vPull,
+                               double hSmooth, double vSmooth, double hDead, double vDead, double delta) {
+        double[] result = new double[2];
+        if (hPull <= 0.0) yawDiff = 0.0;
+        if (vPull <= 0.0) pitchDiff = 0.0;
+
+        double hDeadZoneDeg = hDead * 1.5;
+        double vDeadZoneDeg = vDead * 1.5;
+
+        if (inDeadZoneH) {
+            if (Math.abs(yawDiff) > hDeadZoneDeg) inDeadZoneH = false;
+        } else if (Math.abs(yawDiff) <= hDead) {
+            inDeadZoneH = true;
+        }
+        if (inDeadZoneV) {
+            if (Math.abs(pitchDiff) > vDeadZoneDeg) inDeadZoneV = false;
+        } else if (Math.abs(pitchDiff) <= vDead) {
+            inDeadZoneV = true;
+        }
+        if (inDeadZoneH && inDeadZoneV) return result;
+
+        double hTime = 0.06 + hSmooth * 0.24;
+        double vTime = 0.06 + vSmooth * 0.24;
+        if (hPull > 0.0) hTime /= MathHelper.clamp(0.5 + hPull * 0.15, 0.5, 4.0);
+        if (vPull > 0.0) vTime /= MathHelper.clamp(0.5 + vPull * 0.15, 0.5, 4.0);
+
+        double progress = smoothProgress * smoothProgress * (3.0 - 2.0 * smoothProgress);
+        if (progress < 0.001) return result;
+
+        double yawRemaining = yawDiff;
+        if (!inDeadZoneH && Math.abs(yawDiff) > hDead)
+            yawRemaining = yawDiff - Math.signum(yawDiff) * hDead;
+        double pitchRemaining = pitchDiff;
+        if (!inDeadZoneV && Math.abs(pitchDiff) > vDead)
+            pitchRemaining = pitchDiff - Math.signum(pitchDiff) * vDead;
+
+        if (!inDeadZoneH) {
+            double factor = 1.0 - Math.exp(-delta / hTime * progress);
+            result[0] = yawRemaining * factor;
+        }
+        if (!inDeadZoneV) {
+            double factor = 1.0 - Math.exp(-delta / vTime * progress);
+            result[1] = pitchRemaining * factor;
+        }
+        return result;
+    }
+
+    private double stickyPull(double diff, double pull, double deadZone, double absDiff, double delta) {
+        if (pull <= 0.0) return 0.0;
+        if (absDiff <= deadZone) return 0.0;
+        double distFactor = Math.max(0.0, 1.0 - absDiff / 12.0);
+        double strength = stickyStrength.getValue();
+        double effectivePull = pull * (0.3 + distFactor * (1.0 + strength * 2.0));
+        double factor = 1.0 - Math.exp(-effectivePull * delta);
+        double remaining = diff - Math.signum(diff) * deadZone;
+        return remaining * factor;
+    }
+
+    private double flickPull(double diff, double pull, double deadZone, double delta) {
+        double absDiff = Math.abs(diff);
+        if (absDiff <= deadZone) return 0.0;
+        double effectivePull = pull * (1.5 + random.nextDouble() * 0.5);
+        double factor = 1.0 - Math.exp(-effectivePull * delta);
+        double remaining = diff - Math.signum(diff) * deadZone;
+        return remaining * factor;
+    }
+
+    private void applyRotation(double yawMove, double pitchMove) {
+        double maxH = hMaxPerTick.getValue();
+        double maxV = vMaxPerTick.getValue();
+        if (maxH > 0.0) yawMove = clamp(yawMove, -maxH, maxH);
+        if (maxV > 0.0) pitchMove = clamp(pitchMove, -maxV, maxV);
+        if (yawMove != 0.0) mc.player.setYaw(mc.player.getYaw() + (float) yawMove);
+        if (pitchMove != 0.0) mc.player.setPitch(MathHelper.clamp(mc.player.getPitch() + (float) pitchMove, -90.0f, 90.0f));
+    }
+
+    private Entity findTarget() {
+        String name = targetPlayer.getValue();
+        if (name != null && !name.isEmpty()) {
+            Entity named = findTargetByName(name);
+            if (named != null) {
+                targetLocked = named;
+                return named;
+            }
+            if (strictUsername.getValue()) {
+                targetLocked = null;
+                return null;
+            }
+        }
+        double hFovHalf = hFov.getValue() / 2.0;
+        double vFovHalf = vFov.getValue() / 2.0;
+
+        if (lockLastHit.getValue()) {
+            ModuleManager mm = BadisClient.getInstance().getModuleManager();
+            Entity lastHit = mm.getTarget();
+            long elapsed = (System.nanoTime() - mm.getTargetTime()) / 1000000L;
+            if (lastHit != null && elapsed <= (long) lastHitMemory.getValue()) {
+                if (isValidTarget(lastHit)) {
+                    targetLocked = lastHit;
+                    return lastHit;
+                }
+                boolean invalid = !(lastHit instanceof LivingEntity) || !((LivingEntity)lastHit).isAlive() || lastHit.isSpectator();
+                if (invalid) mm.resetTarget();
+            }
+        }
+
+        if (targetLock.getValue() && targetLocked != null) {
+            if (isValidTarget(targetLocked)) {
+                double yawAngle = getAngleDiff(targetLocked, true);
+                double pitchAngle = getAngleDiff(targetLocked, false);
+                if (yawAngle <= hFovHalf && pitchAngle <= vFovHalf) return targetLocked;
+            }
+            targetLocked = null;
+        }
+
+        Entity best = null;
+        double bestScore = Double.MAX_VALUE;
+        Box box = mc.player.getBoundingBox().expand(range.getValue());
+        for (Entity entity : mc.world.getOtherEntities(mc.player, box)) {
+            if (!(entity instanceof LivingEntity)) continue;
+            if (!isValidTarget(entity)) continue;
+            double dist = mc.player.distanceTo(entity);
+            if (dist > range.getValue()) continue;
+            double yawAngle = getAngleDiff(entity, true);
+            double pitchAngle = getAngleDiff(entity, false);
+            if (yawAngle > hFovHalf || pitchAngle > vFovHalf) continue;
+            if (visibilityCheck.getValue() && !mc.player.canSee(entity)) continue;
+            double score = yawAngle * 0.5 + pitchAngle * 0.3 + dist * 0.2;
+            if (lowHpPriority.getValue() && entity instanceof LivingEntity) {
+                LivingEntity living = (LivingEntity) entity;
+                float hpRatio = living.getHealth() / living.getMaxHealth();
+                score *= 0.5 + 0.5 * hpRatio;
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                best = entity;
+            }
+        }
+        if (best != null && targetLock.getValue()) targetLocked = best;
+        return best;
+    }
+
+    private Entity findTargetByName(String name) {
+        String trimmed = name.trim();
+        if (trimmed.isEmpty()) return null;
+        Box box = mc.player.getBoundingBox().expand(range.getValue());
+        for (Entity entity : mc.world.getOtherEntities(mc.player, box)) {
+            if (entity instanceof PlayerEntity && ((PlayerEntity)entity).isAlive() && !entity.isSpectator()
+                && mc.player.distanceTo(entity) <= range.getValue()) {
+                String entityName = entity.getName().getString();
+                if (entityName != null && entityName.equalsIgnoreCase(trimmed)) return entity;
+            }
+        }
+        return null;
+    }
+
+    private boolean isValidTarget(Entity entity) {
+        if (mc.player.distanceTo(entity) > range.getValue()) return false;
+        return isTargetTypeValid(entity);
+    }
+
+    private boolean isTargetTypeValid(Entity entity) {
+        if (entity == null || entity == mc.player) return false;
+        if (!(entity instanceof LivingEntity)) return false;
+        LivingEntity living = (LivingEntity) entity;
+        if (!living.isAlive() || living.isSpectator()) return false;
+        if (entity instanceof ArmorStandEntity) return false;
+        if (entity instanceof PlayerEntity) return targetPlayers.getValue();
+        if (entity instanceof HostileEntity) return targetHostiles.getValue();
+        if (entity instanceof PassiveEntity) return targetAnimals.getValue();
+        return false;
+    }
+
+    private Vec3d getAimPoint(Entity entity) {
+        Vec3d pos = entity.getPos();
+        double offset = vOffset.getValue() * entity.getHeight() * 0.5;
+        return switch (aimPoint.getValue()) {
+            case "Head" -> pos.add(0.0, entity.getEyeY(entity.getPose()) + offset, 0.0);
+            case "Body" -> pos.add(0.0, entity.getHeight() * 0.55 + offset, 0.0);
+            case "Feet" -> pos.add(0.0, 0.2 + offset, 0.0);
+            case "Nearest" -> {
+                Box bb = entity.getBoundingBox();
+                Vec3d cameraPos = mc.player.getCameraPosVec(1.0f);
+                Vec3d lookVec = mc.player.getRotationVec(1.0f);
+                Vec3d center = new Vec3d((bb.minX + bb.maxX) * 0.5, (bb.minY + bb.maxY) * 0.5, (bb.minZ + bb.maxZ) * 0.5);
+                double dot = lookVec.dotProduct(center.subtract(cameraPos));
+                if (dot < 0.0) dot = 0.0;
+                Vec3d hit = cameraPos.add(lookVec.multiply(dot));
+                yield new Vec3d(
+                    MathHelper.clamp(hit.x, bb.minX, bb.maxX),
+                    MathHelper.clamp(hit.y + offset, bb.minY, bb.maxY),
+                    MathHelper.clamp(hit.z, bb.minZ, bb.maxZ)
+                );
+            }
+            default -> pos.add(0.0, entity.getHeight() * 0.65 + offset, 0.0);
+        };
+    }
+
+    private Vec3d getPredictedPosition(Entity entity) {
+        Vec3d aim = getAimPoint(entity);
+        double pred = prediction.getValue();
+        if (pred <= 0.0) return aim;
+        double vx = velocitySmooth.x;
+        double vy = velocitySmooth.y;
+        double vz = velocitySmooth.z;
+        if (vx * vx + vy * vy + vz * vz < 1.0E-6) return aim;
+        double dist = mc.player.distanceTo(entity);
+        double factor = 1.0 + dist * 0.15;
+        double mult = pred * factor;
+        return aim.add(vx * mult, vy * mult, vz * mult);
+    }
+
+    private double[] getRotationTo(Vec3d target) {
+        Vec3d cameraPos = mc.player.getCameraPosVec(1.0f);
+        double dx = target.x - cameraPos.x;
+        double dy = target.y - cameraPos.y;
+        double dz = target.z - cameraPos.z;
+        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        double yaw = Math.toDegrees(Math.atan2(dz, dx)) - 90.0;
+        double pitch = -Math.toDegrees(Math.atan2(dy, horizontalDist));
+        return new double[]{yaw, pitch};
+    }
+
+    private double getAngleDiff(Entity entity, boolean horizontal) {
+        Vec3d pos = entity.getPos().add(0.0, entity.getHeight() * 0.5, 0.0);
+        double[] rotation = getRotationTo(pos);
+        if (horizontal) return Math.abs(MathHelper.wrapDegrees(rotation[0] - mc.player.getYaw()));
+        return Math.abs(rotation[1] - mc.player.getPitch());
+    }
+
+    private double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+}
